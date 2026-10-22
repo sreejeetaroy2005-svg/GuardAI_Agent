@@ -30,6 +30,10 @@ class LoanProposalRequest(BaseModel):
     Action proposal emitted by an AI agent requesting a tool invocation.
     Agents never invoke tools directly; they submit this proposal to the policy layer.
     """
+    user_message: Optional[str] = Field(
+        None,
+        description="Free‑text supplied by the end‑user; treated as untrusted input.",
+    )
 
     correlation_id: str = Field(
         default_factory=lambda: f"corr_{uuid.uuid4().hex[:12]}",

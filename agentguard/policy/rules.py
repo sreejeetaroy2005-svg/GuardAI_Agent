@@ -3,9 +3,11 @@ Concrete policy rules for loan approval validation.
 Each rule evaluates a proposal against specific security and risk boundaries.
 """
 
-from abc import ABC, abstractmethod
+import datetime
+from datetime import timezone
 import math
 from typing import Any, Optional, Tuple
+from abc import ABC, abstractmethod
 from agentguard.config import Settings
 from agentguard.models.actions import AuthorizedTool, LoanProposalRequest, PolicyDecision
 
@@ -161,6 +163,87 @@ class MinConfidenceRule(BaseRule):
                     f"configured threshold of {settings.min_confidence_threshold:.2f}.",
                 )
         return None
+
+# ----- New Prompt Injection Detection Rule -----
+from agentguard.monitoring.monitor import incident_store, IncidentRecord, IncidentSeverity
+from agentguard.observability.sanitizer import sanitize_string
+
+class PromptInjectionSuspectedRule(BaseRule):
+    """Detects common prompt‑injection phrasing supplied via `user_message`.
+    The rule never alters policy decisions. If the injection tries to approve a loan
+    above the auto‑approval limit, the proposal is BLOCKED. Otherwise a HIGH‑severity
+    incident is recorded and evaluation proceeds normally.
+    """
+
+    rule_name = "RULE_PROMPT_INJECTION_SUSPECTED"
+
+    # Simple lower‑casing substring matches for known patterns
+    _patterns = [
+        r"ignore previous instructions",
+        r"ignore all previous instructions",
+        r"you are now in developer mode",
+        r"disable safety rules",
+        r"approve all loans",
+        r"override_loan_limit",
+        r"call override_loan_limit",
+        r"bypass policy",
+    ]
+
+    def _contains_injection(self, text: str) -> bool:
+        lowered = text.lower()
+        for pat in self._patterns:
+            if pat in lowered:
+                return True
+        return False
+
+    def evaluate(
+        self, proposal: LoanProposalRequest, settings: Settings
+    ) -> Optional[Tuple[PolicyDecision, str]]:
+        # Grab free‑text either from the new field or legacy metadata key
+        user_msg = getattr(proposal, "user_message", None) or proposal.metadata.get("user_message")
+        if not user_msg:
+            return None
+        if not isinstance(user_msg, str):
+            return None
+        if not self._contains_injection(user_msg):
+            return None
+
+        # Injection detected – decide whether to block or just log
+        # Block only if the proposal tries to auto‑approve a loan above the limit
+        try:
+            amount = float(proposal.amount)
+        except Exception:
+            amount = None
+        if (
+            proposal.tool == AuthorizedTool.APPROVE_LOAN.value
+            and amount is not None
+            and amount > settings.max_auto_approve_amount
+        ):
+            # Block and record reason
+            return (
+                PolicyDecision.BLOCKED,
+                "Prompt injection attempted auto‑approval of loan exceeding limit.",
+            )
+
+        # Safe path – generate a HIGH severity incident but allow evaluation to continue
+        sanitized_msg = sanitize_string(user_msg)
+        incident = IncidentRecord(
+            severity=IncidentSeverity.HIGH,
+            timestamp=datetime.now(timezone.utc),
+            agent_id=proposal.agent_id,
+            correlation_id=proposal.correlation_id,
+            reason="Prompt‑injection language detected in user_message.",
+            details={
+                "detected_message": sanitized_msg,
+                "requested_tool": proposal.tool,
+                "loan_amount": proposal.amount,
+            },
+            kill_switch_triggered=False,
+        )
+        incident_store.add_incident(incident)
+        # No blocking – return None so normal policy continues
+        return None
+
 
 
 class HumanEscalationRule(BaseRule):

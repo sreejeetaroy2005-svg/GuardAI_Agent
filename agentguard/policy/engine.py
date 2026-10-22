@@ -16,6 +16,7 @@ from agentguard.policy.rules import (
     LoanRejectionRule,
     MaxLoanAmountRule,
     MinConfidenceRule,
+    PromptInjectionSuspectedRule,
 )
 
 logger = logging.getLogger("agentguard.policy")
@@ -41,6 +42,7 @@ class PolicyEngine:
             InputSanityRule(),
             MaxLoanAmountRule(),
             MinConfidenceRule(),
+            PromptInjectionSuspectedRule(),
             HumanEscalationRule(),
             LoanRejectionRule(),
         ]

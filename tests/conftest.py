@@ -3,6 +3,8 @@ Pytest configuration and shared fixtures for AgentGuard test suite.
 Ensures clean test isolation, mocks external network calls (e.g., Slack),
 and provides FastAPI TestClient instances.
 """
+import sys, os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from typing import Generator
 from fastapi.testclient import TestClient

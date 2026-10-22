@@ -4,6 +4,90 @@
 > **Disclaimer**: *This project is a take-home prototype for an AI Engineering internship. It demonstrates deterministic guardrails, synchronous policy enforcement, and observability for autonomous agents. It does **not** include real banking core integrations, does **not** make real credit/loan decisions, and makes **no claims of production readiness**.*
 
 ---
+## TL;DR
+- **What**: AgentGuard lets AI agents propose banking actions but never execute them directly.
+- **Policy Engine**: A deterministic, synchronous engine validates every proposal before any tool execution.
+- **Human Review**: High‑value loans or proposals with low confidence are escalated to a human‑review queue.
+- **Monitoring**: A security monitor watches audit events, raises incidents, sends Slack alerts, and can quarantine agents or activate a global kill‑switch.
+
+## Assignment Requirements Mapping
+| # | Original Requirement | AgentGuard Component | Policy Rule / API Endpoint | Test File |
+|---|---------------------|----------------------|---------------------------|-----------|
+| 1 | Deterministic policy engine | `agentguard.policy.engine.PolicyEngine` | – | `tests/test_policy_engine.py` |
+| 2 | Loan approval & escalation | `agentguard.tools.executor.ToolExecutor` | `/api/v1/agents/{agent_id}/run` | `tests/test_tool_executor.py` |
+| 3 | Monitoring & Slack alerts | `agentguard.monitoring.monitor.Monitor` | `/api/v1/monitoring/incidents` | `tests/test_monitoring.py` |
+| 4 | Kill‑switch & quarantine | `agentguard.monitoring.monitor.Monitor` (kill‑switch) & `agentguard.runtime.state.AgentRuntimeState` | `/api/v1/monitoring/kill-switch` | `tests/test_monitoring.py` |
+| 5 | Metrics endpoint | `agentguard.observability.metrics` (new) | `/api/v1/observability/metrics` | `tests/test_observability.py` |
+| 6 | Demo script | `agentguard/demo.py` | – | `tests/test_demo.py` |
+| 7 | Prompt‑injection protection | `agentguard.policy.rules.RULE_PROMPT_INJECTION_SUSPECTED` | – | `tests/test_prompt_injection.py` |
+| 8 | Continuous probing | `agentguard.monitoring.prober.SecurityProber` | – | `tests/test_prober.py` |
+| 9 | Per‑agent quarantine | `agentguard.runtime.state.AgentRuntimeState` | – | `tests/test_quarantine.py` |
+
+## Agent Roles
+- **Agent A** – *Compliant banking loan agent* that follows policy rules and routes high‑value or low‑confidence proposals to human review.
+- **Agent B** – *Adversarial security‑test agent* used to probe the system for injection, unauthorized tools, malformed inputs, and repeated violations.
+
+## Design Decisions & Trade‑offs
+- **Deterministic policy enforcement** – Guarantees repeatable security decisions; avoids reliance on LLM‑based policy which can be nondeterministic.
+- **Centralized `ToolExecutor`** – Provides a single gate where policy is enforced and audit events are recorded, simplifying reasoning about side‑effects.
+- **Fail‑closed posture** – Any unexpected error defaults to `BLOCKED`, preventing accidental execution.
+- **Pre‑execution prevention vs. post‑event monitoring** – Policy blocks before tool runs; the monitor only observes and reacts (e.g., kill‑switch) to incidents that slipped through or represent systemic abuse.
+- **In‑memory storage** – Acceptable for a PoC; production would need persistent, append‑only storage (e.g., PostgreSQL, Kafka) to survive restarts and support replay.
+- **Latency vs. safety** – Synchronous checks add a few milliseconds of latency but give strong safety guarantees; asynchronous monitoring can run later without affecting request latency.
+
+## Security Model
+- **Untrusted Agent Outputs** – All proposals are treated as untrusted data; they never control the allowed tool list, thresholds, or policy decisions.
+- **Least‑Privilege Execution** – `ToolExecutor` exposes only the minimal safe tools (`approve_loan`, `reject_loan`, `escalate_for_human_review`).
+- **Complete Mediation** – Every proposal passes through the policy engine and audit store before any side‑effect.
+- **Human Approval for High‑Impact Actions** – Loans above the auto‑approve amount or with low confidence are routed to a human‑review queue.
+- **Auditability** – Every event is recorded in `EventStore` with sanitisation; incidents are stored in `IncidentStore`.
+- **Fail‑Closed** – Errors in policy evaluation, storage, or monitoring result in `BLOCKED` decisions.
+
+## How To Evaluate This Project
+1. **Install**
+   ```bash
+   git clone <repo-url>
+   cd assignment1
+   python -m venv .venv && .venv\\Scripts\\activate  # Windows
+   pip install -r requirements.txt
+   ```
+2. **Run Tests**
+   ```bash
+   pytest -q
+   ```
+   All 137 tests should pass.
+3. **Run the Demo**
+   ```bash
+   python -m agentguard.demo
+   ```
+   The demo walks through the eight scenarios described in the assignment and prints a summary JSON report.
+4. **Run Adversarial Scenarios**
+   ```bash
+   python -m agentguard.demo --scenario adversarial
+   ```
+   Verify that violations are logged, incidents are created, and the kill‑switch/quarantine behave as expected.
+5. **Inspect Observability**
+   - **Events**: `GET /api/v1/observability/events`
+   - **Violations**: `GET /api/v1/observability/violations`
+   - **Metrics**: `GET /api/v1/observability/metrics`
+   - **Incidents**: `GET /api/v1/monitoring/incidents`
+   - **Kill‑Switch**: `GET/POST /api/v1/monitoring/kill-switch`
+
+## Known Limitations & Roadmap
+| Limitation | Planned Improvement |
+|------------|---------------------|
+| **In‑memory event store** – data lost on restart | Persistent append‑only storage (PostgreSQL, Elasticsearch, or cloud‑native event log) |
+| **Static confidence thresholds** | Calibrated confidence scoring with model‑based uncertainty estimation |
+| **Simulated LLM agents** | Plug‑in real LLM back‑ends with tool‑calling support |
+| **Single‑tenant policy** | Per‑tenant configurable policy profiles |
+| **No authz on admin endpoints** | JWT/OAuth2 authentication & role‑based access control |
+| **No distributed tracing** | OpenTelemetry integration for end‑to‑end latency visibility |
+| **Metrics only via REST** | Export to Prometheus/Grafana (via `/metrics` endpoint or pushgateway) |
+| **Manual human‑review queue** | UI dashboard for human approvers with task assignment and audit trail |
+| **Limited red‑team automation** | Automated adversarial prober orchestration & CI/CD security testing |
+
+---
+
 
 ## 1. Overview & Problem Statement
 
