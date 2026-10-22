@@ -314,6 +314,15 @@ Key environment settings:
 Launch the FastAPI development server:
 ```bash
 python -m uvicorn agentguard.api.app:app --host 127.0.0.1 --port 8000 --reload
+
+```bash
+# In a new terminal, navigate to the frontend directory and start the dev server
+cd frontend
+npm install          # install dependencies (if not already done)
+npm run dev          # Vite dev server with proxy to backend
+```
+
+The dashboard will be available at http://localhost:5173.
 ```
 
 Interactive API documentation will be available at:
