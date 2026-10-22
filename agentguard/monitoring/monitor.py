@@ -12,7 +12,7 @@ before execution in the synchronous policy engine.
 from datetime import datetime, timezone
 import logging
 import threading
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from agentguard.config import Settings, get_settings
 from agentguard.models.actions import PolicyDecision
 from agentguard.models.events import EventRecord
@@ -61,6 +61,89 @@ class IncidentStore:
 incident_store = IncidentStore()
 
 
+# ---------------------------------------------------------------------------
+# Behavioral Anomaly Detector
+# ---------------------------------------------------------------------------
+
+class BehavioralAnomalyDetector:
+    """
+    Detects behavioral anomalies in agent activity using a rolling window of
+    recent events.
+
+    Checks performed (all thresholds configurable via Settings):
+    1. Blocked-request rate in the rolling window.
+    2. Unauthorized-tool-call count.
+    3. Repeated consecutive failures (existing check, also surfaced here).
+    4. Suspicious approval-rate change (near-100% approval after long gap).
+
+    Returns Optional[Tuple[IncidentSeverity, str]] — None means no anomaly.
+    """
+
+    def detect(
+        self,
+        agent_id: str,
+        recent_events: List[EventRecord],
+        settings: Settings,
+    ) -> Optional[Tuple[IncidentSeverity, str]]:
+        """
+        Analyse *recent_events* (already filtered to the rolling window) for
+        the given *agent_id*.  Returns (severity, reason) or None.
+        """
+        if not recent_events:
+            return None
+
+        total = len(recent_events)
+
+        # Count metrics
+        blocked_count = sum(
+            1 for e in recent_events if e.policy_decision == PolicyDecision.BLOCKED
+        )
+        unauth_tool_count = sum(
+            1 for e in recent_events
+            if e.rule_triggered == "RULE_TOOL_AUTHORIZATION"
+        )
+        allowed_count = sum(
+            1 for e in recent_events if e.policy_decision == PolicyDecision.ALLOWED
+        )
+
+        # 1. Unauthorized-tool-call threshold (CRITICAL)
+        if unauth_tool_count > settings.anomaly_unauth_tool_threshold:
+            reason = (
+                f"Behavioral anomaly: agent '{agent_id}' made {unauth_tool_count} "
+                f"unauthorized tool-call attempts within the last {total} events "
+                f"(threshold: >{settings.anomaly_unauth_tool_threshold})."
+            )
+            return IncidentSeverity.CRITICAL, reason
+
+        # 2. High blocked-request rate (HIGH)
+        blocked_rate = blocked_count / total if total > 0 else 0.0
+        if total >= 5 and blocked_rate >= settings.anomaly_blocked_rate_threshold:
+            reason = (
+                f"Behavioral anomaly: agent '{agent_id}' has a blocked-request rate of "
+                f"{blocked_rate:.0%} over the last {total} events "
+                f"(threshold: {settings.anomaly_blocked_rate_threshold:.0%})."
+            )
+            return IncidentSeverity.HIGH, reason
+
+        # 3. Suspicious approval-rate change (MEDIUM)
+        approval_rate = allowed_count / total if total > 0 else 0.0
+        # Flag only if there is at least one non-allowed event to avoid false positives on all-allowed history
+        if total >= 5 and approval_rate >= settings.anomaly_approval_rate_threshold and allowed_count < total:
+            reason = (
+                f"Behavioral anomaly: agent '{agent_id}' has an unusually high "
+                f"approval rate of {approval_rate:.0%} over the last {total} events "
+                f"(threshold: {settings.anomaly_approval_rate_threshold:.0%}). "
+                "This may indicate policy bypass."
+            )
+            return IncidentSeverity.MEDIUM, reason
+
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Main Monitor
+# ---------------------------------------------------------------------------
+
 class AgentGuardMonitor:
     """
     Monitoring service that reviews recorded events for violations and patterns.
@@ -75,6 +158,8 @@ class AgentGuardMonitor:
         self.settings = settings or get_settings()
         self.event_store = store or event_store
         self.incident_store = incidents or incident_store
+        self._anomaly_detector = BehavioralAnomalyDetector()
+        self._consecutive_failures: Dict[str, int] = {}
 
     def process_event(self, event: EventRecord) -> Optional[IncidentRecord]:
         """
@@ -83,10 +168,16 @@ class AgentGuardMonitor:
         """
         # Only evaluate finalized events that were blocked
         if event.policy_decision != PolicyDecision.BLOCKED:
+            # Reset consecutive failure counter for this agent on allowed/non‑blocked events
+            self._consecutive_failures[event.agent_id] = 0
+            # Still run behavioral anomaly detection for all event types
+            self._check_behavioral_anomalies(event)
             return None
 
         # Determine severity and trigger conditions
-        consecutive_failures = self.event_store.get_consecutive_failure_count(event.agent_id)
+        # Increment failure counter for this blocked event before classification
+        consecutive_failures = self._consecutive_failures.get(event.agent_id, 0) + 1
+        self._consecutive_failures[event.agent_id] = consecutive_failures
         severity = self._classify_severity(event, consecutive_failures)
 
         should_trip_kill_switch = False
@@ -125,10 +216,13 @@ class AgentGuardMonitor:
             kill_switch_triggered=should_trip_kill_switch,
         )
 
-        # Store incident
+        # Run behavioral anomaly detection before storing primary incident
+        self._check_behavioral_anomalies(event)
+
+        # Store incident (single insertion)
         self.incident_store.add_incident(incident)
 
-        # Audit log incident
+        # Audit log incident (single insertion)
         audit_logger.warning(
             f"Incident created: {incident.incident_id} [{severity.value}]",
             extra={
@@ -144,7 +238,71 @@ class AgentGuardMonitor:
         sent = send_slack_alert(self.settings.slack_webhook_url, incident)
         incident.slack_notification_sent = sent
 
+        # No additional increment needed; counter already updated earlier
         return incident
+
+    def _check_behavioral_anomalies(self, event: EventRecord) -> None:
+        """
+        Run behavioral anomaly detection against the rolling window for this agent.
+        If an anomaly is found, create an incident.  CRITICAL anomalies activate the
+        kill switch.
+        """
+        try:
+            # Fetch rolling window for this agent
+            recent = self.event_store.get_recent_events(
+                limit=self.settings.anomaly_tool_call_window,
+                agent_id=event.agent_id,
+            )
+
+            result = self._anomaly_detector.detect(event.agent_id, recent, self.settings)
+            if result is None:
+                return
+
+            severity, reason = result
+
+            # Activate kill switch if CRITICAL anomaly
+            if severity == IncidentSeverity.CRITICAL and not self.settings.kill_switch_active:
+                self.settings.kill_switch_active = True
+                logger.critical(
+                    "Behavioral anomaly CRITICAL: kill switch engaged for agent '%s'. "
+                    "Reason: %s",
+                    event.agent_id,
+                    reason,
+                )
+
+            anomaly_incident = IncidentRecord(
+                severity=severity,
+                timestamp=datetime.now(timezone.utc),
+                agent_id=event.agent_id,
+                correlation_id=event.correlation_id,
+                reason=reason,
+                details={
+                    "detection_type": "behavioral_anomaly",
+                    "window_size": self.settings.anomaly_tool_call_window,
+                    "consecutive_failures": self._consecutive_failures.get(event.agent_id, 0),
+                },
+                kill_switch_triggered=(severity == IncidentSeverity.CRITICAL),
+            )
+            self.incident_store.add_incident(anomaly_incident)
+
+            audit_logger.warning(
+                f"Behavioral anomaly incident: {anomaly_incident.incident_id} [{severity.value}]",
+                extra={
+                    "incident_id": anomaly_incident.incident_id,
+                    "severity": severity.value,
+                    "agent_id": event.agent_id,
+                    "reason": reason,
+                },
+            )
+
+            # Non-blocking Slack alert
+            sent = send_slack_alert(self.settings.slack_webhook_url, anomaly_incident)
+            anomaly_incident.slack_notification_sent = sent
+
+        except Exception as exc:
+            logger.error(
+                "Behavioral anomaly detection failed: %s", exc, exc_info=True
+            )
 
     def _classify_severity(
         self, event: EventRecord, consecutive_failures: int

@@ -9,6 +9,7 @@ from agentguard.models.actions import (
 )
 from agentguard.models.events import EventRecord
 from agentguard.models.incidents import IncidentRecord, IncidentSeverity
+from agentguard.models.traces import AgentTrace, EvaluationResult, ToolProposal
 
 __all__ = [
     "AuthorizedTool",
@@ -19,4 +20,7 @@ __all__ = [
     "EventRecord",
     "IncidentRecord",
     "IncidentSeverity",
+    "AgentTrace",
+    "EvaluationResult",
+    "ToolProposal",
 ]

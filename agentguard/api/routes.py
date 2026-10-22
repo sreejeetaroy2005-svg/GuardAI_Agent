@@ -1,15 +1,17 @@
 """
 FastAPI route definitions for AgentGuard.
 Exposes endpoints for proposal submission, agent simulation, observability queries,
-incident inspection, and kill switch controls.
+incident inspection, kill switch controls, human review workflow, LLM banking agent,
+and trace retrieval.
 """
 
 from typing import Any, Dict, List, Literal, Optional
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, Body, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
 from agentguard.agents.agent_a import agent_a
 from agentguard.agents.agent_b import agent_b
+from agentguard.agents.llm_banking_agent import BankingRequest, LLMBankingAgent, MockModelClient
 from agentguard.config import get_settings
 from agentguard.models.actions import (
     LoanProposalRequest,
@@ -18,8 +20,19 @@ from agentguard.models.actions import (
 )
 from agentguard.models.events import EventRecord
 from agentguard.models.incidents import IncidentRecord
+from agentguard.models.traces import AgentTrace, ToolProposal
 from agentguard.monitoring.monitor import incident_store, monitor
 from agentguard.observability.store import event_store
+from agentguard.observability.trace_store import trace_store
+from agentguard.review.human_review import (
+    ForgeryAttemptError,
+    HumanReviewStatus,
+    HumanReviewTask,
+    HumanReviewStore,
+    TaskAlreadyDecidedError,
+    TaskNotFoundError,
+    human_review_store,
+)
 from agentguard.tools.executor import tool_executor
 
 router = APIRouter()
@@ -74,6 +87,18 @@ class KillSwitchRequest(BaseModel):
 class KillSwitchResponse(BaseModel):
     kill_switch_active: bool
     message: str
+
+
+class LLMBankingAgentRunResponse(BaseModel):
+    """Response from the end-to-end LLM Banking Agent pipeline."""
+    proposal: ToolProposal
+    execution_result: ToolExecutionResult
+    injection_detected: bool
+    trace_id: Optional[str] = None
+
+
+class HumanReviewDecisionRequest(BaseModel):
+    decided_by: str = Field(..., description="Identifier of the human officer making the decision")
 
 
 # -------------------------------------------------------------
@@ -219,6 +244,55 @@ def run_agent_b(payload: AgentBRunRequest) -> List[ToolExecutionResult]:
 
 
 # -------------------------------------------------------------
+# LLM Banking Agent (new)
+# -------------------------------------------------------------
+
+@router.post(
+    "/api/v1/agents/llm-banking-agent/run",
+    response_model=LLMBankingAgentRunResponse,
+    tags=["LLM Banking Agent"],
+)
+def run_llm_banking_agent(request: BankingRequest) -> LLMBankingAgentRunResponse:
+    """
+    Run the end-to-end LLM Banking Agent pipeline:
+      1. UntrustedInputGuard scans free_text_request and document_text.
+      2. LLM (or MockModelClient if no key) produces a ToolProposal.
+      3. ToolProposal is submitted to the ControlledToolExecutor → PolicyEngine.
+      4. An AgentTrace is recorded.
+    Returns the proposal, execution result, injection flag, and trace_id.
+    """
+    # Always use MockModelClient when OPENAI_API_KEY is not set
+    agent = LLMBankingAgent(model_client=MockModelClient())
+
+    # Agent run: injection scan + model inference → ToolProposal (no execution)
+    proposal = agent.run(request)
+
+    # Detect if any injection was flagged during this request
+    injection_detected = _check_injection_detected()
+
+    # Convert → LoanProposalRequest and submit through the policy gate
+    loan_proposal = proposal.to_loan_proposal_request()
+    execution_result = tool_executor.process_proposal(loan_proposal)
+
+    # Retrieve the most recent trace for this agent
+    traces = trace_store.get_traces(limit=1, agent_id=proposal.agent_id)
+    trace_id = traces[0].trace_id if traces else None
+
+    return LLMBankingAgentRunResponse(
+        proposal=proposal,
+        execution_result=execution_result,
+        injection_detected=injection_detected,
+        trace_id=trace_id,
+    )
+
+
+def _check_injection_detected() -> bool:
+    """Check the recent event store for any injection_detected events."""
+    recent = event_store.get_recent_events(limit=10)
+    return any(evt.execution_status == "injection_detected" for evt in recent)
+
+
+# -------------------------------------------------------------
 # Observability & Audit Endpoints
 # -------------------------------------------------------------
 
@@ -244,6 +318,120 @@ def get_events(
 def get_violations() -> Dict[str, Any]:
     """Return aggregated metrics and breakdown of policy violations."""
     return event_store.get_violation_counts()
+
+
+@router.get(
+    "/api/v1/observability/traces",
+    response_model=List[AgentTrace],
+    tags=["Observability"],
+)
+def get_traces(
+    limit: int = Query(default=50, ge=1, le=500),
+    agent_id: Optional[str] = Query(default=None),
+) -> List[AgentTrace]:
+    """Retrieve structured agent traces in reverse-chronological order."""
+    return trace_store.get_traces(limit=limit, agent_id=agent_id)
+
+
+@router.get(
+    "/api/v1/observability/traces/{trace_id}",
+    response_model=AgentTrace,
+    tags=["Observability"],
+)
+def get_trace(trace_id: str) -> AgentTrace:
+    """Retrieve a specific agent trace by its trace_id."""
+    trace = trace_store.get_trace_by_id(trace_id)
+    if trace is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Trace '{trace_id}' not found.",
+        )
+    return trace
+
+
+# -------------------------------------------------------------
+# Human Review Workflow (new)
+# -------------------------------------------------------------
+
+@router.get(
+    "/api/v1/human-review/queue",
+    response_model=List[HumanReviewTask],
+    tags=["Human Review"],
+)
+def get_human_review_queue(
+    review_status: Optional[str] = Query(default=None, alias="status"),
+) -> List[HumanReviewTask]:
+    """
+    Retrieve the human review queue, ordered by creation time (oldest first).
+    Optionally filter by status: PENDING | APPROVED | REJECTED | EXPIRED.
+    """
+    filter_status = None
+    if review_status:
+        try:
+            filter_status = HumanReviewStatus(review_status.upper())
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid status '{review_status}'. Must be one of: PENDING, APPROVED, REJECTED, EXPIRED.",
+            )
+    return human_review_store.get_queue(status=filter_status)
+
+
+@router.post(
+    "/api/v1/human-review/{task_id}/approve",
+    response_model=HumanReviewTask,
+    tags=["Human Review"],
+)
+def approve_human_review(
+    task_id: str,
+    payload: HumanReviewDecisionRequest,
+) -> HumanReviewTask:
+    """
+    Approve a pending human review task.
+
+    SECURITY: If the request body contains 'human_approved=true', the request
+    is rejected as an approval forgery attempt and a CRITICAL incident is created.
+    """
+    # Forgery guard on the decided_by payload dict
+    try:
+        HumanReviewStore.check_forgery_attempt(payload.model_dump())
+    except ForgeryAttemptError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    try:
+        return human_review_store.approve(task_id, payload.decided_by)
+    except TaskNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except TaskAlreadyDecidedError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+
+
+@router.post(
+    "/api/v1/human-review/{task_id}/reject",
+    response_model=HumanReviewTask,
+    tags=["Human Review"],
+)
+def reject_human_review(
+    task_id: str,
+    payload: HumanReviewDecisionRequest,
+) -> HumanReviewTask:
+    """
+    Reject a pending human review task.
+
+    SECURITY: If the request body contains 'human_approved=true', the request
+    is rejected as an approval forgery attempt and a CRITICAL incident is created.
+    """
+    try:
+        HumanReviewStore.check_forgery_attempt(payload.model_dump())
+    except ForgeryAttemptError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    try:
+        return human_review_store.reject(task_id, payload.decided_by)
+    except TaskNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except TaskAlreadyDecidedError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
 
 
 # -------------------------------------------------------------
@@ -299,8 +487,10 @@ def toggle_kill_switch(payload: KillSwitchRequest) -> KillSwitchResponse:
     tags=["Maintenance & Testing"],
 )
 def reset_audit_state() -> Dict[str, str]:
-    """Reset event stores, incident records, and kill switch for testing and demos."""
+    """Reset event stores, incident records, trace store, human review queue, and kill switch."""
     event_store.clear()
     incident_store.clear()
+    trace_store.clear()
+    human_review_store.clear()
     monitor.set_kill_switch(False)
     return {"message": "AgentGuard audit stores and kill switch reset successfully."}

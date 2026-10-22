@@ -12,13 +12,16 @@ from agentguard.api.app import app
 from agentguard.config import Settings, get_settings
 from agentguard.monitoring.monitor import incident_store, monitor
 from agentguard.observability.store import event_store
+from agentguard.observability.trace_store import trace_store
+from agentguard.review.human_review import human_review_store
 
 
 @pytest.fixture(autouse=True)
 def reset_stores_and_settings() -> Generator[None, None, None]:
     """
     Automatically reset all in-memory event stores, incident stores,
-    and kill switch settings before and after each test.
+    trace stores, human review store, and kill switch settings before
+    and after each test.
     """
     settings = get_settings()
     settings.kill_switch_active = False
@@ -29,11 +32,15 @@ def reset_stores_and_settings() -> Generator[None, None, None]:
 
     event_store.clear()
     incident_store.clear()
+    trace_store.clear()
+    human_review_store.clear()
 
     yield
 
     event_store.clear()
     incident_store.clear()
+    trace_store.clear()
+    human_review_store.clear()
     settings.kill_switch_active = False
 
 
